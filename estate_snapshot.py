@@ -39,7 +39,8 @@ def do_collect(a):
     print(f"Collecting into {out}")
     try:
         collect.run(out, tenant=a.tenant, subscription_ids=subs, customer=a.customer, cost_days=a.cost_days,
-                    resume=a.resume, skip=skip, metrics_days=a.metrics_days, with_entra=a.entra)
+                    resume=a.resume, skip=skip, metrics_days=a.metrics_days, with_entra=a.entra,
+                    cost_months=a.cost_months)
     except AzureError as e:
         sys.exit(f"Collection stopped: {e}")
     return out
@@ -129,6 +130,8 @@ def main():
         c.add_argument("--subscriptions", help="Comma-separated subscription IDs or names; default is all in the tenant")
         c.add_argument("--out", help="Output folder; default snapshots/<customer>-<date>")
         c.add_argument("--cost-days", type=int, default=30)
+        c.add_argument("--cost-months", type=int, default=6,
+                       help="Whole calendar months of spend to report, plus the current part-month (default 6)")
         c.add_argument("--metrics-days", type=int, default=30, help="Window for Azure Monitor metrics (default 30)")
         c.add_argument("--resume", action="store_true", help="Carry on an interrupted run in --out, keeping finished stages")
         c.add_argument("--skip", help="Comma-separated stages to leave out: " + ", ".join(collect.OPTIONAL))

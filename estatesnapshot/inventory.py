@@ -69,6 +69,13 @@ def write(e, path):
     _sheet(wb, "Advisor", e.advisor_recs)
     _sheet(wb, "SecurityFindings", e.findings)
     _sheet(wb, "Costs", [{"subscription": e.sub(c["subscriptionId"]), **c} for c in e.cost_rows])
+    sp = e.spend()
+    if sp["months"]:
+        subs = sorted({k for m in sp["months"] for k in m["bySub"]})
+        _sheet(wb, "CostByMonth", [{"month": m["month"], "daysCovered": m["days"],
+                                    "wholeMonth": "yes" if m["complete"] else "no",
+                                    **{s: m["bySub"].get(s) for s in subs},
+                                    "total": m["cost"], "changeOnPriorMonth": m["change"]} for m in sp["months"]])
     _sheet(wb, "Dependencies", e.dependencies())
     _sheet(wb, "OutsideScope", e.scope_gaps()["references"])
     _sheet(wb, "Retirements", [{k: v for k, v in r.items() if not k.startswith("_")} for r in e.retirements()])

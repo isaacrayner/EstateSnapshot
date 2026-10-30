@@ -16,6 +16,7 @@ Last updated: 28/10/2026. Source: `docs/Improvement-Handoff.md`. Decisions are l
 | E8 | Component seed beside the network drawing | `design.seed` |
 | E9 | Retirement register and opt-in Entra collector | `data/retirements.json`, `register.py`, `entra.py` |
 | E10 | Progress output, `--resume`, headline facts | `collect.py`, `model_config.headline` |
+| E11 | Spend by calendar month (last 6 whole months plus the current part-month), last month in the headline and section 11, `CostByMonth` sheet | `collect._cost_months`, `model.spend`, `brief.py`, `inventory.py` |
 
 42 tests pass (`python -m pytest tests`); `design.json` and `design-seed.json` validate with zero errors on the local Test-Tenant capture.
 

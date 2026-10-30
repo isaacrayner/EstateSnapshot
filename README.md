@@ -15,7 +15,7 @@ collect  ──►  raw/*.json  ──►  graph  ──►  model  ──►  e
 compare Dev=... Prod=...   (offline, any two or more captures)  ──►  compare.md
 ```
 
-1. **Collect** (`estatesnapshot/collect.py`) - whole-table Azure Resource Graph dumps (resources, containers, role assignments, policy, Advisor, Defender, backup, Site Recovery), actual cost and cost by pricing model from Cost Management, built-in role names from ARM and principal names from Microsoft Graph. Then, per resource, the things Resource Graph does not hold (`config.py`): Cosmos DB databases, containers and throughput; Service Bus topics, subscriptions and queues; site configuration; AKS profile; Log Analytics tables; Logic App connection targets; every diagnostic setting. Then 30 days of Azure Monitor metrics (`metrics.py`) and Log Analytics ingestion by table. Optionally Entra ID (`entra.py`). Read-only; uses your `az login`.
+1. **Collect** (`estatesnapshot/collect.py`) - whole-table Azure Resource Graph dumps (resources, containers, role assignments, policy, Advisor, Defender, backup, Site Recovery), actual cost, cost by pricing model and actual cost per calendar month from Cost Management, built-in role names from ARM and principal names from Microsoft Graph. Then, per resource, the things Resource Graph does not hold (`config.py`): Cosmos DB databases, containers and throughput; Service Bus topics, subscriptions and queues; site configuration; AKS profile; Log Analytics tables; Logic App connection targets; every diagnostic setting. Then 30 days of Azure Monitor metrics (`metrics.py`) and Log Analytics ingestion by table. Optionally Entra ID (`entra.py`). Read-only; uses your `az login`.
 2. **Graph** (`estatesnapshot/graph.py`) - every resource ID found inside another resource's properties becomes an edge. No per-type code, so new services are wired in automatically. Subnets are lifted out of VNets as nodes.
 3. **Model** (`model.py`, `model_config.py`, `nsg.py`, `register.py`) - derives architect-level facts: topology, address overlaps, hybrid links, exposure (NSG rules evaluated in priority order), compute, data, throughput, measured load, access, governance, dated platform changes, resilience, monitoring, cost and dependencies.
 4. **Emit** - `brief.py`, `inventory.py`, `design.py`.
@@ -38,7 +38,7 @@ python estate_snapshot.py compare --drift snapshots\Contoso-2026-09-01 snapshots
 
 Default output: `snapshots\<customer>-<date>\`. Point `--out` at the customer's PRESALES folder and the ADS skill reads `estate.md` in Step 1 as a resource export.
 
-A large estate can take longer than a tool timeout. Progress is printed per stage with elapsed time, and every finished stage is recorded in `manifest.json`, so `--resume` (same `--out`, same subscriptions) continues where the run stopped and only refetches resources that had no record. `--skip` takes `config`, `diagnostics`, `metrics` and `usage`; `--metrics-days` changes the 30-day window.
+A large estate can take longer than a tool timeout. Progress is printed per stage with elapsed time, and every finished stage is recorded in `manifest.json`, so `--resume` (same `--out`, same subscriptions) continues where the run stopped and only refetches resources that had no record. `--skip` takes `config`, `diagnostics`, `metrics` and `usage`; `--metrics-days` changes the 30-day window; `--cost-days` and `--cost-months` change the cost windows (30 days, and 6 whole calendar months plus the current part-month).
 
 ## Access needed
 
@@ -48,7 +48,7 @@ A large estate can take longer than a tool timeout. Progress is printed per stag
 | Service configuration, diagnostic settings | Reader (GET reads only; no keys, secrets or app settings) | Stage fails per resource and is listed under collection gaps; `--resume` retries |
 | Metrics | Reader, plus Monitoring Reader on the subscription for the batch API; Microsoft.Insights registered | Stage listed under collection gaps with the likely cause |
 | Log Analytics ingestion | Read access to the workspace data (`Usage` table query) | Stage listed under collection gaps; `--skip usage` to leave it out |
-| Cost, cost by pricing model | Cost Management Reader (and cost visibility enabled for CSP subscriptions) | Section 11 says so |
+| Cost, cost by pricing model, spend by month | Cost Management Reader (and cost visibility enabled for CSP subscriptions) | Section 11 says so |
 | Principal names | Directory read in the tenant (any member user) | Role assignments show IDs; partner (CSP/GDAP) groups are labelled as such |
 | Entra ID (`--entra`) | Graph read: Policy.Read.All, RoleManagement.Read.Directory or Directory.Read.All, Organization.Read.All | Each part listed as a gap; the rest is kept |
 
@@ -72,7 +72,7 @@ A large estate can take longer than a tool timeout. Progress is printed per stag
 - **Measured load:** 429 percentage by Cosmos DB container, normalised RU peaks and days at 100%, Service Bus dead letters, plan CPU and memory, SQL CPU, each with sample coverage.
 - **Exposure:** inbound allow rules evaluated against higher-priority denies (closed, partly closed or open), the rules that name each public IP, WAF mode and rule set, and how many sites accept public network access.
 - **Scope:** subscriptions outside the capture that resources point at (peerings, private endpoint targets, registries, diagnostic destinations).
-- **Logging and billing:** every diagnostic setting, the largest Log Analytics tables, each subscription's offer (Pay-As-You-Go, EA, CSP) and cost by pricing model.
+- **Logging and billing:** every diagnostic setting, the largest Log Analytics tables, each subscription's offer (Pay-As-You-Go, EA, CSP), cost by pricing model, and actual spend for each of the last six whole calendar months plus the month so far, with the change on the month before.
 - **Dated platform changes:** matched from `estatesnapshot/data/retirements.json`; each entry names the Learn page that states the date.
 
 ## Tests

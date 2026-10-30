@@ -357,7 +357,43 @@ def _part2(e):
         w(table([("Category", "category"), ("High-impact recommendation", "problem"), ("Resources", "resources")], adv["high"], cap=15))
     w("")
 
-    w(f"## 11. Cost (actual, last {costs['days']} days)\n")
+    w("## 11. Cost and spend\n")
+    sp = e.spend()
+    if sp["months"]:
+        scur = sp["currency"] or cur
+        w("**Actual cost by calendar month** (Cost Management, every subscription in scope)\n")
+        rows = []
+        for m in sp["months"]:
+            short = m["label"].split()[0][:3]
+            if m["change"] is not None:
+                change = f"{m['change']:+.1f}% on {m['previous']}"
+            else:
+                change = "n/a (part month)" if not m["complete"] else "n/a (month before not in this capture)"
+            rows.append({"month": m["label"],
+                         "covered": "whole month" if m["complete"] else f"1 to {m['days']} {short} ({m['days']} of {m['daysInMonth']} days)",
+                         "costFmt": money(m["cost"], scur),
+                         "perDay": money(m["perDay"], scur) if m["perDay"] is not None else "n/a",
+                         "change": change})
+        w(table([("Month", "month"), ("Covered", "covered"), ("Actual cost", "costFmt"),
+                 ("Cost a day", "perDay"), ("Change on prior month", "change")], rows, cap=13, sheet="CostByMonth"))
+        lf, mt = sp["lastFull"], sp["mtd"]
+        if lf:
+            line = f"Last full calendar month ({lf['label']}): {money(lf['cost'], scur)}"
+            line += f", {lf['change']:+.1f}% on {lf['previous']}" if lf["change"] is not None else f"; {lf['previous']} not in the capture"
+            w(line + ".")
+        if mt:
+            w(f"Month to date is {money(mt['cost'], scur)} over {mt['days']} days of {mt['label']}, "
+              f"{money(mt['perDay'], scur)} a day. Part-month figures are not comparable with a whole month.\n")
+        if lf and len(lf["bySub"]) > 1:
+            w("**Last full calendar month by subscription**\n")
+            w(table([("Subscription", 0), ("Cost", 1)],
+                    [(k, money(v, scur)) for k, v in lf["bySub"].items()], cap=40))
+        if sp["unavailable"]:
+            w(f"Spend data unavailable for: {', '.join(sp['unavailable'])}.\n")
+    else:
+        w("No monthly spend data. Cost Management may be unavailable (common with CSP subscriptions). "
+          + (f"Failed for: {', '.join(sp['unavailable'])}." if sp["unavailable"] else "") + "\n")
+    w(f"### Cost detail, last {costs['days']} days\n")
     bill = e.billing()
     if bill["recorded"]:
         w("**Subscription offer** (the quota id Azure holds for each subscription)\n")
