@@ -87,6 +87,9 @@ class FakeClient:
                 {"metadatavalues": [{"name": {"value": "StatusCode"}, "value": "429"}],
                  "data": [{"timeStamp": "2026-10-01T00:00:00Z", "total": 3}, {"timeStamp": "2026-10-01T01:00:00Z"}]}]}]}]}
         if "CostManagement/query" in u:
+            if '"Monthly"' in json.dumps(body):
+                return {"properties": {"columns": [{"name": "UsageDate"}, {"name": "Cost"}, {"name": "Currency"}],
+                                       "rows": [[202608, 10.0, "GBP"], [202609, 12.0, "GBP"], [202610, 5.0, "GBP"]]}}
             return {"properties": {"columns": [{"name": "Cost"}, {"name": "PricingModel"}, {"name": "Currency"}],
                                    "rows": [[10.0, "OnDemand", "GBP"]]}} if "PricingModel" in json.dumps(body) else \
                    {"properties": {"columns": [{"name": "Cost"}, {"name": "ResourceGroupName"}, {"name": "ServiceName"}, {"name": "Currency"}],
@@ -183,6 +186,12 @@ def test_metrics_fetch_parses_dimensions_and_drops_empty_points():
     assert "api-version=2023-10-01" in url and "filter=StatusCode%20eq%20'*'" in url and " " not in url
 
 
+def test_monthly_cost_parses_the_usage_date():
+    rows = collect._cost_months(FakeClient(), SUB, 6)
+    assert [(r["month"], r["cost"]) for r in rows] == [("2026-08", 10.0), ("2026-09", 12.0), ("2026-10", 5.0)]
+    assert all(r["subscriptionId"] == SUB and r["currency"] == "GBP" for r in rows)
+
+
 def test_nothing_in_collection_can_write():
     """Read-only guarantee: no PUT, PATCH or DELETE anywhere, and POST only to the query-style endpoints."""
     allowed_post = ("Microsoft.ResourceGraph/resources", "CostManagement/query", "getByIds", "metrics:getBatch", "/v1/workspaces/")
@@ -200,7 +209,7 @@ def test_full_run_writes_every_stage(fake):
     out = str(fake / "run")
     m = collect.run(out, customer="X", log=lambda *_: None)
     for stage in ("cosmos_config", "servicebus_config", "site_config", "aks_config", "loganalytics_tables", "logic_targets",
-                  "diagnostics", "metrics", "loganalytics_usage", "cost_pricing"):
+                  "diagnostics", "metrics", "loganalytics_usage", "cost_pricing", "cost_months"):
         assert m["stages"][stage] == "done", stage
     assert m["subscriptions"][0]["quotaId"] == "CSP_2015-05-01" and "completedAt" in m
     non_get = {(mth, u.split("?")[0].rsplit("/", 1)[-1]) for mth, u in (c for c in FakeClient.instances[0].calls if c[0] != "ARG") if mth != "GET"}

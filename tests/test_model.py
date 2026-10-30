@@ -177,6 +177,22 @@ def test_register_override_path(prod, tmp_path):
     assert [r["change"] for r in rows] == ["Only this"]
 
 
+def test_spend_by_calendar_month(prod):
+    sp = prod.spend()
+    assert [m["month"] for m in sp["months"]][0] == "2026-10"                 # newest first
+    assert sp["lastFull"]["month"] == "2026-09" and sp["lastFull"]["cost"] == 120.0
+    assert sp["lastFull"]["change"] == 20.0                                   # 100 -> 120
+    assert sp["lastFull"]["previous"] == "August 2026"
+    assert sp["mtd"]["month"] == "2026-10" and sp["mtd"]["days"] == 27         # captured on the 27th
+    assert sp["mtd"]["change"] is None                                        # a part-month has no comparison
+    assert sp["currency"] == "GBP" and sp["unavailable"] == []
+
+
+def test_spend_is_empty_for_a_capture_without_monthly_cost(prod):
+    prod.cost_month_rows = []                              # a capture taken before this stage existed
+    assert prod.spend()["months"] == [] and prod.spend()["lastFull"] is None
+
+
 # -- headline facts and the brief ---------------------------------------------------------------------------------------------
 
 def test_headline_and_brief_sections(prod):
@@ -185,6 +201,7 @@ def test_headline_and_brief_sections(prod):
     assert text.index("## Headline facts") < text.index("## 1. Shape of the estate")
     for needle in ("Cosmos DB accounts and throughput", "Service Bus namespaces", "6.1 Measured load", "Site configuration",
                    "8.1 Dated platform changes", "Referenced but not captured", "Log Analytics ingestion", "Subscription offer",
+                   "Actual cost by calendar month", "Last full calendar month (September 2026)",
                    "Diagnostic settings:", "Web application firewall policies"):
         assert needle in text, needle
     assert EM_DASH not in text                       # no em dashes in generated output

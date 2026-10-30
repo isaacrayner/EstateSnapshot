@@ -2,6 +2,8 @@
 architect needs for an as-is: shape, networking, exposure, compute, data,
 access, governance, resilience, monitoring and cost. Facts only - no scoring,
 no recommendations. Interpretation belongs to the ADS."""
+import calendar
+import datetime as dt
 import ipaddress
 import json
 import os
@@ -46,6 +48,7 @@ class Estate(ConfigFacts):
         self.backup_items = load("backup_items", [])
         self.asr_items = load("asr_items", [])
         self.cost_rows = load("costs", [])
+        self.cost_month_rows = load("cost_months", [])
         self.principals = load("principals", {})
         self.role_defs = load("role_definitions", {})
         self.manifest.setdefault("stages", {})
@@ -862,12 +865,67 @@ class Estate(ConfigFacts):
             rg[(self.sub(c["subscriptionId"]), c["resourceGroup"])] += c["cost"]
             svc[c["service"]] += c["cost"]
         total = sum(c["cost"] for c in self.cost_rows)
-        missing = [k.split(":", 1)[1] for k in self.manifest.get("errors", {}) if k.startswith("cost:")]
         return {"currency": cur, "days": self.manifest.get("costDays"), "total": round(total, 2),
                 "bySub": {self.sub(k): v for k, v in self.cost_by_sub().items()},
                 "topRgs": sorted(((k, round(v, 2)) for k, v in rg.items()), key=lambda x: -x[1])[:15],
                 "topServices": sorted(((k, round(v, 2)) for k, v in svc.items()), key=lambda x: -x[1])[:15],
-                "unavailable": missing}
+                "unavailable": self._cost_missing()}
+
+    def _cost_missing(self):
+        """Subscriptions where Cost Management refused, named once even if both cost queries failed."""
+        out = []
+        for key in (self.manifest.get("errors") or {}):
+            kind, _, sub = key.partition(":")
+            if kind in ("cost", "cost_months") and sub and sub not in out:
+                out.append(sub)
+        return out
+
+    MONTH_NAMES = ("January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December")
+
+    @staticmethod
+    def _previous_month(month):
+        y, m = int(month[:4]), int(month[5:7])
+        return f"{y - 1}-12" if m == 1 else f"{y}-{m - 1:02d}"
+
+    def captured_date(self):
+        try:
+            return dt.date.fromisoformat(str(self.manifest.get("capturedAt") or "")[:10])
+        except ValueError:
+            return None
+
+    def spend(self):
+        """Actual cost per calendar month, newest first, from the monthly Cost Management query.
+        The capture month is part-month: it is marked incomplete and its change is not stated.
+        Change is only given where both months are whole, so a part-month never distorts it."""
+        cur = next((r.get("currency") for r in self.cost_month_rows if r.get("currency")), "")
+        cap = self.captured_date()
+        by = defaultdict(lambda: defaultdict(float))
+        for r in self.cost_month_rows:
+            if r.get("month"):
+                by[r["month"]][r["subscriptionId"]] += r["cost"]
+        rows = []
+        for month in sorted(by, reverse=True):
+            y, m = int(month[:4]), int(month[5:7])
+            if cap and (y, m) > (cap.year, cap.month):
+                continue                                  # a month that had not started at capture
+            days_in = calendar.monthrange(y, m)[1]
+            days = min(days_in, cap.day) if cap and (y, m) == (cap.year, cap.month) else days_in
+            cost = round(sum(by[month].values()), 2)
+            rows.append({"month": month, "label": f"{self.MONTH_NAMES[m - 1]} {y}", "cost": cost,
+                         "days": days, "daysInMonth": days_in, "complete": days >= days_in,
+                         "perDay": round(cost / days, 2) if days else None,
+                         "bySub": {self.sub(k): round(v, 2) for k, v in sorted(by[month].items(), key=lambda x: -x[1])}})
+        index = {r["month"]: r for r in rows}
+        for r in rows:
+            prev = index.get(self._previous_month(r["month"]))
+            r["previous"] = prev["label"] if prev else ""
+            r["change"] = (round((r["cost"] - prev["cost"]) / prev["cost"] * 100, 1)
+                           if prev and prev["complete"] and r["complete"] and prev["cost"] else None)
+        last_full = next((r for r in rows if r["complete"]), None)
+        mtd = rows[0] if rows and not rows[0]["complete"] else None
+        return {"currency": cur, "months": rows, "lastFull": last_full, "mtd": mtd,
+                "unavailable": self._cost_missing()}
 
     # -- dependencies --------------------------------------------------------
 

@@ -594,6 +594,17 @@ class ConfigFacts:
         if costs["total"]:
             L.append(f"Actual cost over the last {costs['days']} days: {costs['currency']} {costs['total']:,.0f}"
                      + (f"; unavailable for {', '.join(costs['unavailable'])}" if costs["unavailable"] else "") + ".")
+        sp = self.spend()
+        if sp["lastFull"]:
+            lf = sp["lastFull"]
+            text = f"Spend, last full calendar month ({lf['label']}): {sp['currency']} {lf['cost']:,.0f}"
+            if lf["change"] is not None:
+                text += f", {lf['change']:+.1f}% on {lf['previous']}"
+            if sp["mtd"]:
+                mt = sp["mtd"]
+                text += (f"; month to date to {mt['days']} {mt['label'].split()[0]}: "
+                         f"{sp['currency']} {mt['cost']:,.0f}")
+            L.append(text + ".")
         gaps = self.scope_gaps()["summary"]
         subs_out = [x for x in gaps if not x["subscription"].startswith("unknown")]
         hosts_out = sum(x["references"] for x in gaps if x["subscription"].startswith("unknown"))

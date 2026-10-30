@@ -89,7 +89,11 @@ def build(tmp, env="prod", registry="acrdev.azurecr.io", functions=3, with_confi
                                            "type": "microsoft.resources/subscriptions/resourcegroups", "subscriptionId": SUB}],
            "costs": [{"subscriptionId": SUB, "resourceGroup": rg, "service": "Azure Cosmos DB", "cost": 100.0, "currency": "GBP"}],
            "cost_pricing": [{"subscriptionId": SUB, "pricingModel": "OnDemand", "cost": 80.0, "currency": "GBP"},
-                            {"subscriptionId": SUB, "pricingModel": "Reservation", "cost": 20.0, "currency": "GBP"}]}
+                            {"subscriptionId": SUB, "pricingModel": "Reservation", "cost": 20.0, "currency": "GBP"}],
+           # monthly actual cost: May to September whole, October part (captured on the 27th)
+           "cost_months": [{"subscriptionId": SUB, "month": month, "cost": cost, "currency": "GBP"}
+                           for month, cost in (("2026-05", 100.0), ("2026-06", 110.0), ("2026-07", 120.0),
+                                               ("2026-08", 100.0), ("2026-09", 120.0), ("2026-10", 70.0))]}
     if with_config:
         site_cfg = [
             ("a", {"linuxFxVersion": "DOTNET-ISOLATED|8.0", "use32BitWorkerProcess": True, "alwaysOn": True}),

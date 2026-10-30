@@ -83,6 +83,18 @@ QUERIES = {
 }
 
 
+def _cost_error(e):
+    """Explain a Cost Management refusal in terms Isaac can act on."""
+    msg = str(e)
+    if "SubscriptionCostDisabled" in msg:
+        return "cost visibility is disabled for this subscription (typical for CSP; the partner can enable it)"
+    if "HTTP 403" in msg:
+        return "no permission to read cost (needs Cost Management Reader or Reader with billing access)"
+    if "429" in msg:
+        return "Cost Management throttled the request; rerun collect later"
+    return msg
+
+
 def _cost(client, sub_id, days):
     end = dt.date.today()
     start = end - dt.timedelta(days=days)
@@ -104,6 +116,43 @@ def _cost(client, sub_id, days):
     return [{"subscriptionId": sub_id, "resourceGroup": (r.get("ResourceGroupName") or "").lower(),
              "service": r.get("ServiceName"), "cost": round(float(r.get("Cost") or 0), 2),
              "currency": r.get("Currency")} for r in rows]
+
+
+def _cost_months(client, sub_id, months, today=None):
+    """Actual cost per calendar month, for the last `months` complete months plus the current
+    part-month. Cost Management resolves a monthly window to whole months, so the current month
+    comes back as its month-to-date figure and the model marks it as incomplete."""
+    end = today or dt.date.today()
+    y, m = end.year, end.month - (max(1, months) - 1)
+    while m <= 0:
+        m += 12
+        y -= 1
+    start = dt.date(y, m, 1)
+    body = {
+        "type": "ActualCost",
+        "timeframe": "Custom",
+        "timePeriod": {"from": start.isoformat() + "T00:00:00Z", "to": end.isoformat() + "T23:59:59Z"},
+        "dataset": {"granularity": "Monthly", "aggregation": {"totalCost": {"name": "Cost", "function": "Sum"}}},
+    }
+    d = client.request("POST", f"{ARM}/subscriptions/{sub_id}/providers/Microsoft.CostManagement/query"
+                               f"?api-version=2023-11-01", body, retries=3, max_wait=40, base_wait=5)
+    cols = [c["name"] for c in d.get("properties", {}).get("columns", [])]
+    rows = [dict(zip(cols, r)) for r in d.get("properties", {}).get("rows", [])]
+    out = []
+    for r in rows:
+        ud = r.get("UsageDate")
+        if isinstance(ud, float) and ud.is_integer():
+            ud = int(ud)
+        s = str(ud or "")
+        if s.isdigit() and len(s) == 6:                       # 202609, the monthly-granularity form
+            month = f"{s[:4]}-{s[4:]}"
+        elif len(s) >= 7 and s[:4].isdigit() and s[5:7].isdigit():
+            month = s[:7]
+        else:
+            continue
+        out.append({"subscriptionId": sub_id, "month": month,
+                    "cost": round(float(r.get("Cost") or 0), 2), "currency": r.get("Currency")})
+    return out
 
 
 def _cost_pricing(client, sub_id, days):
@@ -256,7 +305,7 @@ class Run:
 
 
 def run(out_dir, tenant=None, subscription_ids=None, customer=None, cost_days=30, log=print,
-        resume=False, skip=(), metrics_days=30, with_entra=False):
+        resume=False, skip=(), metrics_days=30, with_entra=False, cost_months=6):
     skip = set(skip or ())
     bad = skip - set(OPTIONAL)
     if bad:
@@ -289,7 +338,8 @@ def run(out_dir, tenant=None, subscription_ids=None, customer=None, cost_days=30
             "subscriptions": [{"id": s["subscriptionId"], "name": s["displayName"],
                                "quotaId": (s.get("subscriptionPolicies") or {}).get("quotaId"),
                                "spendingLimit": (s.get("subscriptionPolicies") or {}).get("spendingLimit")} for s in subs],
-            "costDays": cost_days, "metricsDays": metrics_days, "skipped": sorted(skip), "entra": with_entra,
+            "costDays": cost_days, "costMonths": cost_months, "metricsDays": metrics_days,
+            "skipped": sorted(skip), "entra": with_entra,
             "counts": {}, "errors": {}, "stages": {},
         }
     r = Run(out_dir, manifest, resume, log)
@@ -320,17 +370,26 @@ def run(out_dir, tenant=None, subscription_ids=None, customer=None, cost_days=30
                 manifest["errors"].pop(f"cost:{s['displayName']}", None)
                 r.say(f"    cost {s['displayName']:<28} {len(rows):>4} rows")
             except AzureError as e:
-                msg = str(e)
-                if "SubscriptionCostDisabled" in msg:
-                    msg = "cost visibility is disabled for this subscription (typical for CSP; the partner can enable it)"
-                elif "HTTP 403" in msg:
-                    msg = "no permission to read cost (needs Cost Management Reader or Reader with billing access)"
-                elif "429" in msg:
-                    msg = "Cost Management throttled the request; rerun collect later"
+                msg = _cost_error(e)
                 manifest["errors"][f"cost:{s['displayName']}"] = msg
                 r.say(f"    cost {s['displayName']:<28} unavailable: {msg}")
         r.save("costs", costs)
         r.say(f"  {'costs':<22} {len(costs):>6}" + ("  (some subscriptions failed)" if any(k.startswith('cost:') for k in manifest['errors']) else ""))
+
+    if not r.skip_done("cost_months"):
+        monthly = []
+        for s in subs:
+            try:
+                rows = _cost_months(client, s["subscriptionId"], cost_months)
+                monthly += rows
+                manifest["errors"].pop(f"cost_months:{s['displayName']}", None)
+                r.say(f"    months {s['displayName']:<26} {len(rows):>4} rows")
+            except AzureError as e:
+                msg = _cost_error(e)
+                manifest["errors"][f"cost_months:{s['displayName']}"] = msg
+                r.say(f"    months {s['displayName']:<26} unavailable: {msg}")
+        r.save("cost_months", monthly)
+        r.say(f"  {'cost_months':<22} {len(monthly):>6}")
 
     if not r.skip_done("cost_pricing"):
         pricing = []
