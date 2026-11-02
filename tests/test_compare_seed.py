@@ -99,10 +99,91 @@ def test_seed_ids_are_stable_between_runs(tmp_path):
     assert [n["id"] for n in design.seed(a)["nodes"]] == [n["id"] for n in design.seed(b)["nodes"]]
 
 
+def test_seed_puts_a_subnet_deployed_service_in_its_subnet(tmp_path):
+    d = fixtures.build(str(tmp_path / "s"), "prod")
+    p = os.path.join(d, "raw", "resources.json")
+    rs = json.load(open(p))
+    vnet = next(r for r in rs if r["type"] == "microsoft.network/virtualnetworks")
+    vm = next(r for r in rs if r["type"] == "microsoft.compute/virtualmachines")
+    nic_id = fixtures.rid("rg-app-prod", "Microsoft.Network/networkInterfaces", "nic-vm")
+    vm["properties"]["networkProfile"] = {"networkInterfaces": [{"id": nic_id}]}
+    rs.append(fixtures.res("rg-app-prod", "Microsoft.Network/networkInterfaces", "nic-vm",
+                           {"ipConfigurations": [{"properties": {"subnet": {"id": vnet["properties"]["subnets"][0]["id"]}}}]}))
+    json.dump(rs, open(p, "w"))
+    nodes = {n["id"]: n for n in design.seed(Estate(d))["nodes"]}
+    placed = next(n for n in nodes.values() if n["name"] == "vm-prod-01")
+    assert nodes[placed["parent"]]["kind"] == "subnet"
+    assert nodes[nodes[placed["parent"]]["parent"]]["kind"] == "vnet"
+    assert nodes[placed["parent"]]["cidr"] == "10.10.1.0/24"
+
+
+def test_seed_leaves_out_a_subnet_service_whose_subnet_is_unknown(prod):
+    d = design.seed(prod)
+    assert not any(n["name"] == "vm-prod-01" for n in d["nodes"])
+    assert "subnet not known" in d["meta"]["note"]
+
+
 @pytest.mark.skipif(not os.path.isdir(DIAGRAMMER), reason="AzureDiagrammer not installed")
 def test_seed_validates_in_azure_diagrammer(prod, tmp_path):
     p = tmp_path / "seed.json"
     p.write_text(json.dumps(design.seed(prod)))
+    r = subprocess.run([sys.executable, os.path.join(DIAGRAMMER, "bin", "validate.py"), str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "0 error" in r.stdout
+
+
+def test_measured_flows_place_traffic_on_subnets_and_the_internet(prod):
+    mf = prod.measured_flows()
+    assert mf["collected"] and mf["logs"] == 1 and not mf["gaps"]
+    inbound = next(r for r in mf["rows"] if r["src"] == "20.1.2.3")
+    assert inbound["connections"] == 2 and inbound["allowedBy"] == "k8s-azure-lb_allow_IPv4" and inbound["deniedBy"] == "nsg-aks_deny-https"
+    ends = {(x["src"][0], x["dst"][0]) for x in prod.flow_edges()}
+    assert ("internet", "subnet") in ends and ("subnet", "internet") in ends
+
+
+def test_network_drawing_is_the_vnets_and_the_measured_paths(prod):
+    d = design.build(prod)
+    assert d["meta"]["diagram_type"] == "network"
+    ids = {n["id"]: n for n in d["nodes"]}
+    assert sum(1 for n in d["nodes"] if n["kind"] == "vnet") == 1 and sum(1 for n in d["nodes"] if n["kind"] == "subnet") == 1
+    vnet = next(n for n in d["nodes"] if n["kind"] == "vnet")
+    assert vnet["cidr"] == "10.10.0.0/16" and "10.10.1.0/24" in [n.get("cidr") for n in d["nodes"]]
+    flows = {(ids[e["from"]]["name"], ids[e["to"]]["name"], e["flow"]) for e in d["edges"]}
+    assert ("Internet", "snet-app", "ingress") in flows and ("snet-app", "Internet", "egress") in flows
+    ingress = next(e for e in d["edges"] if e["flow"] == "ingress")
+    assert "2 new connection" in ingress["note"] and "DENIED by nsg-aks_deny-https" in ingress["note"]
+    assert "measured from 1 NSG flow log" in d["meta"]["note"]
+
+
+@pytest.mark.skipif(not os.path.isdir(DIAGRAMMER), reason="AzureDiagrammer not installed")
+def test_network_drawing_validates_in_azure_diagrammer(prod, tmp_path):
+    p = tmp_path / "network.json"
+    p.write_text(json.dumps(design.build(prod)))
+    r = subprocess.run([sys.executable, os.path.join(DIAGRAMMER, "bin", "validate.py"), str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+# -- E12: overview --------------------------------------------------------------------------------------
+
+def test_overview_groups_the_estate_into_subscriptions_and_tiers(prod):
+    d = design.overview(prod)
+    by_id = {n["id"]: n for n in d["nodes"]}
+    assert d["meta"]["diagram_type"] == "context"
+    subs = [n for n in d["nodes"] if n["kind"] == "subscription"]
+    assert [n["name"] for n in subs] == ["Sub prod"]
+    tiers = {n["name"]: n for n in d["nodes"] if n.get("parent") == subs[0]["id"]}
+    assert set(tiers) >= {"Web and ingress", "Compute", "Data", "Integration", "Monitoring and backup"}
+    assert tiers["Web and ingress"]["detail"] == "1 service"           # the application gateway, the only web tier entry point
+    assert tiers["Compute"]["detail"] == "5 services"                  # the 3 function apps, the VM and AKS
+    assert set(by_id) & {"act_internet"}                               # a public site brings the internet actor
+    assert (by_id["act_internet"]["id"], tiers["Web and ingress"]["id"]) in {(e["from"], e["to"]) for e in d["edges"]}
+    assert subs[0]["callout"]["facts"][0] == {"label": "VNets", "value": "1"}
+
+
+@pytest.mark.skipif(not os.path.isdir(DIAGRAMMER), reason="AzureDiagrammer not installed")
+def test_overview_validates_in_azure_diagrammer(prod, tmp_path):
+    p = tmp_path / "overview.json"
+    p.write_text(json.dumps(design.overview(prod)))
     r = subprocess.run([sys.executable, os.path.join(DIAGRAMMER, "bin", "validate.py"), str(p)], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "0 error" in r.stdout

@@ -1,11 +1,14 @@
 """Thin Azure REST client. Authenticates through the Azure CLI (az login), so the
 tool needs no secrets and no SDK: only Reader on the target subscriptions."""
+import datetime as dt
+import gzip
 import json
 import shutil
 import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ARM = "https://management.azure.com"
@@ -59,7 +62,9 @@ class Client:
             self._tokens[audience] = (d["accessToken"], expires)
             return d["accessToken"]
 
-    def request(self, method, url, body=None, audience="arm", retries=5, max_wait=60, base_wait=1):
+    def request(self, method, url, body=None, audience="arm", retries=5, max_wait=60, base_wait=1, expect=()):
+        """Any non-success status listed in `expect` raises with `expected` set, so a caller can tell
+        'this was refused' from 'this failed' without matching the status again."""
         data = json.dumps(body).encode() if body is not None else None
         for attempt in range(retries + 1):
             req = urllib.request.Request(url, data=data, method=method)
@@ -78,8 +83,48 @@ class Client:
                     time.sleep(wait)
                     continue
                 detail = e.read().decode(errors="replace")[:400]
-                raise AzureError(f"HTTP {e.code} {method} {url.split('?')[0]}: {detail}", e.code)
+                err = AzureError(f"HTTP {e.code} {method} {url.split('?')[0]}: {detail}", e.code)
+                err.expected = e.code in expect
+                raise err
         raise AzureError(f"gave up after retries: {url}")
+
+    def sas(self, account, container=None):
+        """A read-list SAS for the account blob endpoint, signed by the local az identity."""
+        args = ["storage", "container", "generate-sas", "--account-name", account, "--permissions", "rl",
+                "--services", "b", "--resource-types", "sco", "--expiry",
+                (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")]
+        if container:
+            args += ["--name", container]
+        return _az(args).strip()
+
+    def storage_blob_host(self, account):
+        try:
+            return _az(["storage", "account", "show", "--name", account, "--query", "primaryEndpoints.blob", "-o", "tsv"]).strip()
+        except AzureError:
+            return f"https://{account}.blob.core.windows.net/"
+
+    def storage_blobs(self, host, container, prefix, sas):
+        """List blob names under a prefix in one storage container, following the continuation token."""
+        names, marker = [], None
+        while True:
+            url = f"{host}{container}?restype=container&comp=list&prefix={urllib.parse.quote(prefix)}&maxresults=1000"
+            if marker:
+                url += "&marker=" + urllib.parse.quote(marker)
+            body = self.get_bytes(url + "&" + sas)
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(body)
+            names += [b.findtext("Name") for b in root.iter("Blob") if b.findtext("Name")]
+            marker = root.findtext("NextMarker")
+            if not marker:
+                return names
+
+    def get_gzip_json(self, url):
+        """GET a gzipped JSON file from storage (a flow log) and return it parsed."""
+        raw = self.get_bytes(url)
+        try:
+            return json.loads(gzip.decompress(raw))
+        except (OSError, ValueError):
+            return json.loads(raw)      # storage serves a blob already decoded when it was stored uncompressed
 
     # -- helpers -------------------------------------------------------------
 
@@ -91,6 +136,20 @@ class Client:
             out.extend(d.get("value", []))
             url = d.get("nextLink")
         return out
+
+    def get_bytes(self, url, retries=3):
+        """GET a non-JSON body (a flow log is a gzipped file in a storage account)."""
+        for attempt in range(retries + 1):
+            req = urllib.request.Request(url, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    return r.read()
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise AzureError(f"HTTP {e.code} GET {url.split('?')[0]}", e.code)
+        raise AzureError(f"gave up after retries: {url.split('?')[0]}")
 
     def subscriptions(self):
         d = self.request("GET", f"{ARM}/subscriptions?api-version=2022-12-01")

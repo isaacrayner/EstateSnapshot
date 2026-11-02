@@ -7,6 +7,7 @@ import datetime as dt
 import ipaddress
 import json
 import os
+import re
 from collections import Counter, defaultdict
 
 from . import catalogue as cat
@@ -14,6 +15,9 @@ from . import nsg as nsgrules
 from .graph import Graph
 from .model_config import ConfigFacts
 from .util import g, gb, lc, name_of  # noqa: F401  (re-exported for design.py)
+
+# Flow paths are built from these, which design.py also uses to tell which subnets a reader can see.
+CIDR = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
 
 T_VNET = "microsoft.network/virtualnetworks"
 T_SUBNET = "microsoft.network/virtualnetworks/subnets"
@@ -151,6 +155,153 @@ class Estate(ConfigFacts):
                          "supporting": t in cat.SUPPORTING,
                          "tags": "; ".join(f"{k}={v}" for k, v in (r.get("tags") or {}).items())})
         return rows
+
+    # -- NSG flow logs (E14) ---------------------------------------------------
+
+    def measured_flows(self, top=60):
+        """What actually crossed the network, from the newest NSG flow log files: one row per source
+        and destination pair, with the new connections counted, the rules that carried it and any
+        rule that denied it. Returns the rows plus the logs that left a gap, so 'no file' is never
+        mistaken for 'no traffic'."""
+        rows, gaps, seen = {}, [], set()
+        for log in self.cfg.get("flowlogs", {}).values():
+            name = self.label(log["id"])
+            if log.get("gap"):
+                gaps.append({"log": name, "target": self.label(log.get("target") or ""), "gap": log["gap"]})
+            for r in log.get("records") or []:
+                k = (r["src"], r["dst"], r["srcPort"], r["dstPort"], r["protocol"], r["direction"])
+                if k in seen:
+                    continue                    # the same new row appears in more than one traffic analytics window
+                seen.add(k)
+                row = rows.setdefault((r["src"], r["dst"], "in" if lc(r["direction"]) in ("in", "inbound") else "out"), {
+                    "src": r["src"], "dst": r["dst"], "direction": r["direction"],
+                    "connections": 0, "protocols": set(), "ports": set(),
+                    "allowedBy": set(), "deniedBy": set(), "logs": set()})
+                row["connections"] += 1
+                row["protocols"].add(r["protocol"])
+                row["ports"].add(f"{r['dstPort']}/{r['protocol']}")
+                row["logs"].add(name)
+                if r["decision"] == "allowed":
+                    row["allowedBy"].add(r["rule"])
+                else:
+                    row["deniedBy"].add(r["rule"])
+        out = []
+        for row in rows.values():
+            row["protocols"] = ", ".join(sorted(row["protocols"]))
+            row["ports"] = ", ".join(sorted(row["ports"])[:4])
+            row["allowedBy"] = ", ".join(sorted(row["allowedBy"])[:3])
+            row["deniedBy"] = ", ".join(sorted(row["deniedBy"])[:3])
+            row["logs"] = ", ".join(sorted(row["logs"]))
+            out.append(row)
+        out.sort(key=lambda x: (-x["connections"], x["src"], x["dst"]))
+        return {"rows": out[:top], "total": len(rows), "gaps": gaps,
+                "logs": len(self.cfg.get("flowlogs", {})),
+                "collected": self.collected("flowlogs") and bool(self.cfg.get("flowlogs"))}
+
+    def flow_edges(self):
+        """The busiest measured paths, placed into the network drawing's vocabulary: a subnet by its
+        prefix, a public address on the internet, anything a captured resource owns by what it is.
+        A private endpoint flow has no address at all, which is how Azure reports it."""
+        nets = self.networks()
+        subnet_at = [(s["prefix"], v["name"], s["name"], s["_id"]) for v in nets for s in v["subnets"] if s["prefix"]]
+        owned = {}
+        for r in self.resources:
+            for ip in self._addresses(r):
+                owned.setdefault(ip, r["id"])
+        out = []
+        for row in self.measured_flows()["rows"]:
+            ends = [self._where_ip(row["src"], subnet_at, owned), self._where_ip(row["dst"], subnet_at, owned)]
+            # a captured public IP is still a public address: the flow started or ended outside the VNet
+            for i, (kind, ref) in enumerate(ends):
+                if kind == "service" and self.type_of(ref) == "microsoft.network/publicipaddresses":
+                    ends[i] = ("internet", row["src"] if i == 0 else row["dst"])
+            if None in ends or ends[0] == ends[1]:
+                continue
+            out.append({"src": ends[0], "dst": ends[1], "row": row})
+        return out
+
+    def _addresses(self, r):
+        p = r.get("properties") or {}
+        t = lc(r.get("type"))
+        if t == "microsoft.network/publicipaddresses":
+            return [p.get("ipAddress")] if p.get("ipAddress") else []
+        if t == "microsoft.network/networkinterfaces":
+            return [c.get("properties", {}).get("privateIPAddress") for c in p.get("ipConfigurations") or []
+                    if c.get("properties", {}).get("privateIPAddress")]
+        return []
+
+    def _where_ip(self, ip, subnet_at, owned):
+        import ipaddress
+        for prefix, _vnet, _subnet, sid in subnet_at:
+            try:
+                if ipaddress.ip_address(ip) in ipaddress.ip_network(prefix.split(",")[0].strip(), strict=False):
+                    return ("subnet", sid)
+            except ValueError:
+                continue
+        if ip in owned:
+            return ("service", owned[ip])
+        try:
+            private = ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return None
+        return None if private or not ip else ("internet", ip)
+
+    def network_overview(self):
+        """Each VNet as one box with its subnets, and the busiest measured flows as edges when flow
+        logs were collected."""
+        nets = self.networks()
+        if not nets:
+            return None
+        by_sub = defaultdict(list)
+        for v in nets:
+            by_sub[v["subscription"]].append(v)
+        nodes, edges, named = [], [], {}
+        for sub, vnets in by_sub.items():
+            nodes.append({"id": self._slug("sub", sub), "kind": "subscription", "name": sub, "zone": "landing_zone"})
+            for v in vnets:
+                vid = self._slug("vnet", v["_id"])
+                named[lc(v["_id"])] = vid
+                n = {"id": vid, "kind": "vnet", "name": v["name"], "parent": self._slug("sub", sub),
+                     "zone": "production" if any(env in lc(v["name"]) or env in lc(sub) for env in ("prod", "production")) else "operations"}
+                if v["addressSpace"] and CIDR.match(v["addressSpace"][0]):
+                    n["cidr"] = v["addressSpace"][0]
+                nodes.append(n)
+                for s in v["subnets"]:
+                    named[lc(s["_id"])] = self._slug("snet", s["_id"])
+                    sn = {"id": named[lc(s["_id"])], "kind": "subnet", "name": s["name"], "parent": vid}
+                    first = (s["prefix"] or "").split(",")[0].strip()
+                    if CIDR.match(first):
+                        sn["cidr"] = first
+                    facts = []
+                    if s["nsg"]:
+                        facts.append({"label": "NSG", "value": s["nsg"]})
+                    if s["occupants"]:
+                        facts.append({"label": "Holds", "value": s["occupants"][:60]})
+                    if facts:
+                        sn["callout"] = {"title": s["name"], "facts": facts}
+                    nodes.append(sn)
+        flowing = self.flow_edges()
+        if any(kind in ("internet",) for e in flowing for kind, _ in (e["src"], e["dst"])):
+            nodes.append(self._internet())
+        for e in flowing:
+            kind, ref = e["src"]
+            kind2, ref2 = e["dst"]
+            a = named.get(lc(ref)) if kind == "subnet" else (self._internet() if kind == "internet" else None)
+            b = named.get(lc(ref2)) if kind2 == "subnet" else (self._internet() if kind2 == "internet" else None)
+            if a and b:
+                row = e["row"]
+                edges.append({"from": a, "to": b, "flow": "sync",
+                              "label": f"{row['connections']} connections" + (f"; {row['deniedBy']} denied" if row["deniedBy"] else "")})
+        return nodes, edges
+
+    def _internet(self):
+        if not hasattr(self, "_act_internet"):
+            self._act_internet = {"id": "act_internet", "kind": "actor", "name": "Internet", "icon": "internet", "zone": "actors"}
+        return self._act_internet
+
+    @staticmethod
+    def _slug(prefix, text):
+        return (prefix + "_" + re.sub(r"[^a-z0-9]+", "_", lc(text)).strip("_"))[:40].rstrip("_")
 
     # -- networking ----------------------------------------------------------
 

@@ -121,6 +121,18 @@ def build(tmp, env="prod", registry="acrdev.azurecr.io", functions=3, with_confi
         raw["logic_targets"] = [{"id": rid(rg, "Microsoft.Logic/workflows", f"logic-{env}"), "state": "Enabled", "uris": [],
                                  "connections": [{"connection": "sftpwithssh", "path": "/files", "method": "post"}],
                                  "connectionIds": {"sftpwithssh": rid(rg, "Microsoft.Web/connections", f"sftp-{env}")}}]
+        raw["flowlogs"] = [{"id": rid(rg, "Microsoft.Network/networkWatchers/flowLogs", "nsg-aks"),
+                            "target": rid(rg, "Microsoft.Network/networkSecurityGroups", "nsg-aks"), "enabled": True,
+                            "storageId": rid(rg, "Microsoft.Storage/storageAccounts", f"saflows{env}"),
+                            "retentionDays": 30, "version": 2, "workspaceId": "", "files": 2, "gap": None,
+                            "records": [
+                                # web traffic into the app subnet, a denied flow next to it, and an outbound path
+                                {"mac": "AA-BB", "src": "20.1.2.3", "dst": "10.10.1.4", "srcPort": "51234", "dstPort": "443",
+                                 "protocol": "TCP", "decision": "allowed", "direction": "In", "rule": "k8s-azure-lb_allow_IPv4", "traffic": "12"},
+                                {"mac": "AA-BB", "src": "20.1.2.3", "dst": "10.10.1.4", "srcPort": "51235", "dstPort": "443",
+                                 "protocol": "TCP", "decision": "denied", "direction": "In", "rule": "nsg-aks_deny-https", "traffic": "1"},
+                                {"mac": "AA-BB", "src": "10.10.1.4", "dst": "13.107.4.50", "srcPort": "51000", "dstPort": "443",
+                                 "protocol": "TCP", "decision": "allowed", "direction": "Out", "rule": "AllowAzureMonitor", "traffic": "30"}]}]
         raw["loganalytics_tables"] = [{"id": rid(rg, "Microsoft.OperationalInsights/workspaces", f"law-{env}"), "tables": [
             {"name": "AKSAudit", "plan": "Analytics", "retentionInDays": 30, "totalRetentionInDays": 30},
             {"name": "Heartbeat", "plan": "Basic", "retentionInDays": 8, "totalRetentionInDays": 90}]}]

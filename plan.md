@@ -1,6 +1,6 @@
 # EstateSnapshot - plan
 
-Last updated: 28/10/2026. Source: `docs/Improvement-Handoff.md`. Decisions are logged in `CLAUDE.md` (D1 to D15).
+Last updated: 01/11/2026. Source: `docs/Improvement-Handoff.md`. Decisions are logged in `CLAUDE.md` (D1 to D20).
 
 ## Done (built and tested offline, 28/10/2026)
 
@@ -17,8 +17,11 @@ Last updated: 28/10/2026. Source: `docs/Improvement-Handoff.md`. Decisions are l
 | E9 | Retirement register and opt-in Entra collector | `data/retirements.json`, `register.py`, `entra.py` |
 | E10 | Progress output, `--resume`, headline facts | `collect.py`, `model_config.headline` |
 | E11 | Spend by calendar month (last 6 whole months plus the current part-month), last month in the headline and section 11, `CostByMonth` sheet | `collect._cost_months`, `model.spend`, `brief.py`, `inventory.py` |
+| E12 | PNG export beside every diagram (`export_png.py` and draw.io, best effort, `--no-png`), and a component seed that keeps subnet-deployed services in their subnet or leaves them out when the subnet is not known | `estate_snapshot.py`, `design.py` |
+| E13 | High-level estate overview (overview.json / .drawio / .png): subscriptions with their network share, one counted box per service tier, edges only where the snapshot holds a reference | `design.overview` |
+| E14 | Measured traffic: the flowlogs stage reads NSG flow log files with a local az SAS; the network drawing is now the VNets and subnets with their NSGs and the measured ingress, egress and subnet-to-subnet paths | `config.flow_log`, `model.measured_flows`, `model.network_overview`, `design.build` |
 
-42 tests pass (`python -m pytest tests`); `design.json` and `design-seed.json` validate with zero errors on the local Test-Tenant capture.
+53 tests pass (`python -m pytest tests`); `overview.json`, `design.json` and `design-seed.json` validate with zero errors on the local Test-Tenant capture and on the synthetic estate. The PNGs export.
 
 ## Next - needs a real estate (cannot be done offline)
 
@@ -29,7 +32,7 @@ The handoff's gates are written against the Rascal captures, which are not reach
 3. Confirm Resource Graph returns `ingressProfile` for AKS (otherwise the direct ARM read in `aks_config` is what supplies it) and that the Rascal ingress rule set reads as closed. The synthetic case is partly closed because its allow rule is protocol `*`.
 4. Confirm the getBatch calls succeed under the account used (Monitoring Reader on the subscription, Microsoft.Insights registered), and that the Log Analytics `Usage` query works under Reader at that customer.
 5. Run `compare Dev=... PreProd=... Prod=...` on the three Rascal captures. Name pairing depends on the real naming convention: check the "no counterpart" list.
-6. Run the seed through Azure Diagrammer and compare it with the Rascal rev3 design.
+6. Run the seed and the overview through Azure Diagrammer and compare them with the Rascal rev3 design. Check the tier counts against the brief's section 2 and that the overview reads at one page on a 729-resource estate.
 7. Entra: confirm which Graph scopes the Azure CLI token actually carries.
 
 ## Open decisions

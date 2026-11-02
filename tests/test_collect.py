@@ -63,6 +63,9 @@ class FakeClient:
         if u.endswith("/config/web"):
             return {"properties": {"linuxFxVersion": "DOTNET|8.0", "use32BitWorkerProcess": True, "appSettings": "SECRET",
                                    "ipSecurityRestrictions": [{"name": "r", "action": "Allow", "priority": 100, "ipAddress": "1.2.3.4/32", "extra": 1}]}}
+        if "/flowLogs/" in u:
+            return {"properties": {"enabled": False, "targetResourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg-aks",
+                                   "storageId": f"/subscriptions/{SUB}/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/saflows"}}
         if "managedClusters" in u and method == "GET":
             return {"sku": {"tier": "Standard"}, "properties": {"ingressProfile": {"webAppRouting": {"enabled": True}},
                                                                 "servicePrincipalProfile": {"secret": "SECRET"}}}
@@ -163,6 +166,31 @@ def test_diagnostics_lists_every_setting_and_marks_unsupported():
     assert len(st["scopes"]) == 5                     # the account plus blob, file, queue and table services
 
 
+def test_flow_log_records_pair_the_flow_tuple_and_drop_the_default_rule():
+    log = {"flows": [{"rule": "DefaultRule_AllowInternetOutBound", "flows": [{"flowTuples": ["1,2,3,4,5,6,7,8"]}]},
+                     {"rule": "k8s-azure-lb_allow_IPv4", "mac": "AA-BB", "flows": [
+                         {"flowTuples": ["1698000000,10.10.1.4,20.1.2.3,51234,443,T,A,12,340,14,35,A,A"]}]},
+                     {"rule": "nsg-aks_deny-https", "flows": [
+                         {"flowTuples": ["1698000060,20.1.2.3,10.10.1.4,443,51234,T,D,1,60,100,40,D,D"]}]}]}
+    recs = config._flow_records(log)
+    # the fixture tuples are positional strings, not real V1/V2 rows, so this checks the field mapping
+    # and the default rule being dropped, not the decision letter
+    assert len(recs) == 2 and all("defaultrule" not in r["rule"].lower() for r in recs)
+    assert recs[0] == {"mac": "AA-BB", "src": "10.10.1.4", "dst": "20.1.2.3", "srcPort": "51234", "dstPort": "443",
+                       "protocol": "TCP", "decision": "allowed", "direction": None, "rule": "k8s-azure-lb_allow_IPv4", "traffic": "12"}
+    assert recs[1]["src"] == "20.1.2.3" and recs[1]["dstPort"] == "51234" and recs[1]["traffic"] == "1"
+
+
+def test_flow_log_says_why_it_has_no_records(monkeypatch):
+    c = FakeClient()
+    on = {"properties": {"enabled": True, "storageId": f"/subscriptions/{SUB}/resourceGroups/r/providers/Microsoft.Storage/storageAccounts/saflows",
+                         "targetResourceId": "/x"}}
+    off = {"properties": {"enabled": False}}
+    monkeypatch.setattr(c, "route", lambda m, u, b, on=on: off if "/flowLogs/" in u else on)
+    rec = config.flow_log(c, {"id": fixtures.rid("rg", "Microsoft.Network/networkWatchers/flowLogs", "nsg-aks")})
+    assert rec["gap"] == "the flow log is disabled" and rec["records"] == []
+
+
 def test_metrics_plan_batches_by_subscription_region_type_and_50():
     rs = [{"id": f"/subscriptions/{SUB}/resourceGroups/r/providers/Microsoft.DocumentDB/databaseAccounts/c{i}", "type": "microsoft.documentdb/databaseaccounts",
            "subscriptionId": SUB, "location": "uksouth"} for i in range(120)]
@@ -203,6 +231,9 @@ def test_nothing_in_collection_can_write():
     for f in ("config.py", "collect.py", "entra.py"):
         src = open(os.path.join(ROOT, "estatesnapshot", f), encoding="utf-8").read()
         assert not re.search(r"listkeys|listsecrets|appsettings/list|/list\?|listConnectionStrings", src, re.I), f
+    # a flow log is read from storage with a SAS signed by the local az identity, never an account key
+    az = open(os.path.join(ROOT, "estatesnapshot", "azure.py"), encoding="utf-8").read()
+    assert "storage\", \"container\", \"generate-sas" in az and "account-name" in az
 
 
 def test_full_run_writes_every_stage(fake):
@@ -237,7 +268,7 @@ def test_interrupted_run_resumes_without_recollecting(fake):
 
 def test_resume_refuses_a_different_scope(fake):
     out = str(fake / "run")
-    collect.run(out, customer="X", log=lambda *_: None, skip=["config", "diagnostics", "metrics", "usage"])
+    collect.run(out, customer="X", log=lambda *_: None, skip=["config", "diagnostics", "metrics", "usage", "flowlogs"])
     m = json.load(open(os.path.join(out, "manifest.json")))
     m["subscriptions"][0]["id"] = "ffffffff-ffff-ffff-ffff-ffffffffffff"
     json.dump(m, open(os.path.join(out, "manifest.json"), "w"))
@@ -247,7 +278,7 @@ def test_resume_refuses_a_different_scope(fake):
 
 def test_skip_leaves_stages_out_and_rejects_typos(fake):
     out = str(fake / "run")
-    m = collect.run(out, customer="X", log=lambda *_: None, skip=["metrics", "diagnostics"])
+    m = collect.run(out, customer="X", log=lambda *_: None, skip=["metrics", "diagnostics", "flowlogs"])
     assert "metrics" not in m["stages"] and "diagnostics" not in m["stages"] and m["stages"]["site_config"] == "done"
     with pytest.raises(AzureError, match="--skip accepts"):
         collect.run(str(fake / "run2"), customer="X", log=lambda *_: None, skip=["metric"])

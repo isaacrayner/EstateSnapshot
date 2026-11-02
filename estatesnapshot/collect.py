@@ -228,7 +228,7 @@ CONFIG_STAGES = [
     ("loganalytics_tables", "microsoft.operationalinsights/workspaces", config.workspace_tables),
     ("logic_targets", "microsoft.logic/workflows", config.logic_app),
 ]
-OPTIONAL = ("config", "diagnostics", "metrics", "usage")      # values accepted by --skip
+OPTIONAL = ("config", "diagnostics", "metrics", "usage", "flowlogs")      # values accepted by --skip
 WORKERS = 8
 
 
@@ -450,6 +450,12 @@ def run(out_dir, tenant=None, subscription_ids=None, customer=None, cost_days=30
         wss = [x for x in resources if (x.get("type") or "").lower() == "microsoft.operationalinsights/workspaces"]
         if wss and not r.skip_done("loganalytics_usage"):
             r.fan_out("loganalytics_usage", [(x["id"], x) for x in wss], lambda x: _usage(client, x, 30))
+
+    # -- NSG flow logs: what actually walked the network (E14) ----------------------
+    if "flowlogs" not in skip:
+        logs = [x for x in resources if (x.get("type") or "").lower() == "microsoft.network/networkwatchers/flowlogs"]
+        if logs and not r.skip_done("flowlogs"):
+            r.fan_out("flowlogs", [(x["id"], x) for x in logs], lambda x: config.flow_log(client, x), compact=True)
 
     # -- Entra (opt-in) -----------------------------------------------------------
     if with_entra and not r.skip_done("entra"):

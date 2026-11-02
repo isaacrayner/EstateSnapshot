@@ -11,7 +11,7 @@ from .util import g, lc, name_of
 
 # raw file -> attribute name; each holds {lowercase resource id: record}
 CONFIG_FILES = ["cosmos_config", "servicebus_config", "site_config", "aks_config", "loganalytics_tables",
-                "logic_targets", "diagnostics", "loganalytics_usage"]
+                "logic_targets", "diagnostics", "loganalytics_usage", "flowlogs"]
 
 QUOTA_NAMES = {
     "payasyougo_2014-09-01": "Pay-As-You-Go", "enterpriseagreement_2014-09-01": "Enterprise Agreement",
