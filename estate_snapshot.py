@@ -8,8 +8,9 @@
     python estate_snapshot.py compare --drift EARLIER_DIR LATER_DIR    the same scope at two times
 
 Outputs in DIR: raw/ (evidence), graph.json, estate.md (ADS brief), inventory.xlsx (appendix),
-design.json + design.drawio (current-state network diagram) and design-seed.json + design-seed.drawio
-(component seed for the target-state diagram).
+design.json + design.drawio + design.png (current-state network diagram) and
+design-seed.json + design-seed.drawio + design-seed.png (component seed for the target-state
+diagram). The PNGs come from the Azure Diagrammer's own draw.io export.
 """
 import argparse
 import datetime as dt
@@ -25,6 +26,31 @@ from estatesnapshot.model import Estate
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIAGRAMMER = os.environ.get("AZURE_DIAGRAMMER", r"C:\Code\AzureDiagrammer")
+DRAWIO_PATHS = (os.environ.get("DRAWIO_PATH"),
+                r"C:\Program Files\draw.io\draw.io.exe",
+                os.path.join(os.environ.get("LOCALAPPDATA") or "", r"Programs\draw.io\draw.io.exe"))
+
+
+def find_drawio():
+    """The draw.io desktop CLI, which export_png.py drives. None if it is not installed."""
+    for p in DRAWIO_PATHS:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def export_png(drawio_file, png_file):
+    """Export a PNG through the diagrammer's wrapper, which only returns success when
+    a fresh file is in place, so a stale image can never look current."""
+    cmd = [sys.executable, os.path.join(DIAGRAMMER, "bin", "export_png.py"), drawio_file, png_file]
+    drawio = find_drawio()
+    if drawio:
+        cmd += ["--drawio", drawio]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0 and os.path.isfile(png_file):
+        return True, f"{os.path.getsize(png_file) // 1024} KB"
+    lines = (r.stderr or r.stdout).strip().splitlines()
+    return False, (lines[-1] if lines else "no output from export_png.py")[-400:]
 
 
 def default_out(customer):
@@ -46,8 +72,9 @@ def do_collect(a):
     return out
 
 
-def emit_design(d, out, base, label):
-    """Write a design, validate it with AzureDiagrammer and, if it passes, emit the .drawio."""
+def emit_design(d, out, base, label, png=True):
+    """Write a design, validate it with AzureDiagrammer and, if it passes, emit the .drawio
+    and the PNG the customer documents embed."""
     dpath = os.path.join(out, base + ".json")
     with open(dpath, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=1)
@@ -60,12 +87,16 @@ def emit_design(d, out, base, label):
     if v.stdout.strip():
         print("    " + v.stdout.strip().replace("\n", "\n    "))
     if v.returncode == 0:
+        drawio_file = os.path.join(out, base + ".drawio")
         r = subprocess.run([sys.executable, os.path.join(DIAGRAMMER, "bin", "emit_drawio.py"), dpath,
-                            "--out", os.path.join(out, base + ".drawio")], capture_output=True, text=True)
+                            "--out", drawio_file], capture_output=True, text=True)
         print(f"  {base + '.drawio':<17} " + ("written" if r.returncode == 0 else "FAILED: " + (r.stderr or r.stdout).strip()[-400:]))
+        if r.returncode == 0 and png:
+            ok, detail = export_png(drawio_file, os.path.join(out, base + ".png"))
+            print(f"  {base + '.png':<17} " + (f"exported ({detail})" if ok else "skipped: " + detail))
 
 
-def do_build(out, retirements=None):
+def do_build(out, retirements=None, png=True):
     if retirements:
         os.environ["ESTATESNAPSHOT_RETIREMENTS"] = retirements
     print(f"Building outputs in {out}")
@@ -83,14 +114,20 @@ def do_build(out, retirements=None):
     inventory.write(e, os.path.join(out, "inventory.xlsx"))
     print("  inventory.xlsx    written")
 
+    o = design.overview(e)
+    if o:
+        emit_design(o, out, "overview", "overview", png)
+    else:
+        print("  overview.json     skipped (nothing in scope)")
+
     d = design.build(e)
     if d:
-        emit_design(d, out, "design", "network")
+        emit_design(d, out, "design", "network", png)
     else:
         print("  design.json       skipped (no networks in scope)")
     s = design.seed(e)
     if s:
-        emit_design(s, out, "design-seed", "seed")
+        emit_design(s, out, "design-seed", "seed", png)
     else:
         print("  design-seed.json  skipped (nothing drawable)")
 
@@ -137,9 +174,12 @@ def main():
         c.add_argument("--skip", help="Comma-separated stages to leave out: " + ", ".join(collect.OPTIONAL))
         c.add_argument("--entra", action="store_true", help="Also read Conditional Access, directory roles and sync status from Microsoft Graph")
         c.add_argument("--retirements", help="Retirement register to match against (default: the one shipped in estatesnapshot/data)")
+        if name == "run":
+            c.add_argument("--no-png", action="store_true", help="Emit the .drawio diagrams but not the PNG exports")
     b = sp.add_parser("build")
     b.add_argument("dir")
     b.add_argument("--retirements", help="Retirement register to match against")
+    b.add_argument("--no-png", action="store_true", help="Emit the .drawio diagrams but not the PNG exports")
     k = sp.add_parser("compare", help="Compare captures offline")
     k.add_argument("targets", nargs="+", help="[Label=]folder, two or more; with --drift exactly two (earlier, later)")
     k.add_argument("--drift", action="store_true", help="Treat the two folders as the same scope at two times, paired by resource id")
@@ -147,13 +187,13 @@ def main():
     a = p.parse_args()
 
     if a.cmd == "build":
-        do_build(a.dir, a.retirements)
+        do_build(a.dir, a.retirements, not a.no_png)
     elif a.cmd == "compare":
         do_compare(a)
     elif a.cmd == "collect":
         do_collect(a)
     else:
-        do_build(do_collect(a), a.retirements)
+        do_build(do_collect(a), a.retirements, not a.no_png)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import re
 from urllib.parse import urlsplit
 
 from .azure import ARM, NOT_THERE, AzureError
+from .util import g, lc, name_of
 
 API_COSMOS = "2024-05-15"
 API_SERVICEBUS = "2021-11-01"
@@ -19,6 +20,7 @@ API_AKS = "2024-09-01"
 API_LA_TABLES = "2022-10-01"
 API_LOGIC = "2019-05-01"
 API_DIAG = "2021-05-01-preview"
+API_FLOWLOG = "2024-05-01"
 
 
 def pick(d, keys):
@@ -206,7 +208,95 @@ def logic_app(client, w):
     return {"id": w["id"], "state": p.get("state"), **logic_targets(p.get("definition"), p.get("parameters"))}
 
 
-# -- Diagnostic settings ------------------------------------------------------
+# -- Network security groups: the last N days of virtual network flow logs --------
+#
+# The flow log is a file in a storage account, one per hour, holding "flows" and "trafficAnalytics"
+# blocks. This reads the newest files the log covers and keeps four figures per flow: the source and
+# destination (address, port, no address at all for private endpoint traffic), the NSG decision and
+# direction, and the byte and packet tallies. A missing or unreadable file is a collection gap, never
+# a silent zero: "no file" and "no traffic" are different facts.
+FLOWLOG = re.compile(r"PT1H_(\d{14})_fl-\w+_(acctime|flowlogtime)")
+FINE_ACCTIME = re.compile(r"PT[1-5]M_(\d{14})_")
+FLOW_MAX_FILES = 48
+
+
+def _flow_records(log):
+    """One flow log file as a list of records the model can pair by flow tuple. V1 files carry only
+    `flows`; V2 files add `trafficAnalytics` blocks, which are read the same way."""
+    out, seen = [], set()
+    blocks = [log] + list(log.get("trafficAnalytics") or [])
+    for block in blocks:
+        direction = block.get("direction")
+        for flow in block.get("flows") or []:
+            rule = flow.get("rule") or ""
+            if "defaultrule" in lc(rule):
+                continue                      # Azure's own default allow/deny is not a customer rule decision
+            mac = flow.get("mac")
+            for grp in flow.get("flows") or []:
+                rows = grp.get("flowTuples") or []
+                for row in rows.split("|") if isinstance(rows, str) else rows:
+                    bits = row if isinstance(row, list) else row.split(",")
+                    if len(bits) < 8:
+                        continue
+                    key = (mac, bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({"mac": mac, "src": bits[1], "dst": bits[2], "srcPort": bits[3], "dstPort": bits[4],
+                                "protocol": {"T": "TCP", "U": "UDP"}.get(bits[5].upper(), bits[5]),
+                                "decision": "allowed" if bits[6].upper().startswith("A") else "denied",
+                                "direction": direction, "rule": rule, "traffic": bits[7] if len(bits) > 7 else None})
+    return out
+
+
+def flow_log(client, log, max_files=FLOW_MAX_FILES):
+    """One NSG flow log: its configuration, where it writes, and the newest records in that storage
+    account. Read-only: a GET of the log, a GET of the account, then blob list and read with a SAS
+    signed by the local az identity (never the account key)."""
+    rid = log["id"]
+    d = client.request("GET", f"{ARM}{rid}?api-version={API_FLOWLOG}")
+    p = d.get("properties") or {}
+    rec = {"id": rid, "target": p.get("targetResourceId"), "enabled": p.get("enabled"),
+           "storageId": p.get("storageId"), "retentionDays": (p.get("retentionPolicy") or {}).get("days"),
+           "version": g(p, "format", "version"),
+           "workspaceId": g(p, "flowAnalyticsConfiguration", "networkWatcherFlowAnalyticsConfiguration",
+                            "workspaceResourceId"),
+           "files": 0, "records": [], "gap": None}
+    if not p.get("enabled"):
+        rec["gap"] = "the flow log is disabled"
+        return rec
+    account = p.get("storageId")
+    if not account:
+        rec["gap"] = "the flow log has no storage account"
+        return rec
+    host = client.storage_blob_host(name_of(account))
+    container = "insights-logs-networksecuritygroupflowevent"
+    parts = rid.strip("/").split("/")
+    # /subscriptions/<s>/resourceGroups/<rg>/providers/Microsoft.Network/networkWatchers/<w>/flowLogs/<nsg>
+    sub, rg, nsg = parts[1], parts[3], parts[-1]
+    prefix = f"{sub}/resourceGroups/{rg}/providers/Microsoft.Network/networkSecurityGroups/{nsg}/"
+    try:
+        sas = client.sas(name_of(account), container)
+        names = [n for n in client.storage_blobs(host, container, prefix, sas) if n.endswith(".json")]
+    except AzureError as e:
+        rec["gap"] = f"the flow log storage could not be listed: {e}"
+        return rec
+
+    def stamp(n):
+        m = FLOWLOG.search(n) or FINE_ACCTIME.search(n)
+        return m.group(1) if m else "0"
+    names = sorted(names, key=stamp, reverse=True)[:max_files]
+    rec["files"] = len(names)
+    if not names:
+        rec["gap"] = "the storage account holds no flow log files for this NSG yet (they appear within the hour)"
+        return rec
+    for n in names:
+        try:
+            rec["records"] += _flow_records(client.get_gzip_json(f"{host}{container}/{n}?{sas}"))
+        except AzureError as e:
+            rec["gap"] = f"{len(names)} file(s) listed, one could not be read: {e}"
+    return rec
+
 
 # Types that accept diagnostic settings. A resource outside this list is not asked: NICs, disks and
 # the like answer 400, which would only add noise. Storage accounts take their settings on the
